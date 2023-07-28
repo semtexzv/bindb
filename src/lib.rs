@@ -69,7 +69,7 @@ pub trait Table: Serialize + DeserializeOwned {
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __table_name {
+macro_rules! __default_name {
     ($a:literal $b:ty) => {$a};
     ($b:ty) => {stringify!($b)};
 }
@@ -86,7 +86,7 @@ macro_rules! table {
     ($table:ty $(as $name:literal)? $(; $fmt:ty)? $($(=> $pkey:tt)+: $keytype:ty),* $(,$idx:ty)*) => {
         #[allow(unused_parens)]
         impl Table for $table {
-            const NAME: &'static str = $crate::__table_name!($($name)? $table);
+            const NAME: &'static str = $crate::__default_name!($($name)? $table);
 
             type Format<'a> =  $crate::__format!($($fmt)?);
             type Indices = ($($idx,)*);
@@ -106,7 +106,7 @@ macro_rules! table {
 
 pub trait Index {
     type Table: Table;
-    /// Name of the table. This should be unique within database
+    /// Name of the table backing this index. This should be unique within database.
     const NAME: &'static str;
     type Key: PartialOrd + Serialize + DeserializeOwned;
     type KeyRef<'a>: PartialOrd + Serialize;
@@ -116,17 +116,17 @@ pub trait Index {
 
 #[macro_export]
 macro_rules! index {
-    ($name:ident, $src:ty, $($($p:ident).+ : $type:ty),+) => {
-        pub struct $name;
+    ($vis:vis $index:ident $(as $name:literal)?, $src:ty, $($(=> $pkey:tt)+: $keytype:ty),*) => {
+        $vis struct $index;
         #[allow(unused_parens)]
-        impl bindb::Index for $name {
+        impl Index for $index {
             type Table = $src;
-            const NAME: &'static str = concat!(stringify!($name) $($(, "_", stringify!($p))*)+);
-            type Key = ( $($type),+ );
-            type KeyRef<'a> = ( $(&'a $type),+ );
+            const NAME: &'static str = $crate::__default_name!($($name)? $index);
+            type Key = ( $($keytype),+ );
+            type KeyRef<'a> = ( $(&'a $keytype),+ );
 
             fn get<'a>(t : &'a Self::Table) -> Self::KeyRef<'a> {
-                ($( &t.$($p).+),+)
+                ($( &t.$($pkey).+),+)
             }
         }
     };
@@ -154,7 +154,7 @@ impl<T> Indices<T> for Tuple
 
     #[inline(always)]
     fn on_update<'a>(db: &Database, tx: &mut RwTxn<'a, 'a>, old: &T, new: &T) {
-        for_tuples!( #(
+        for_tuples!( #({
             let db_inner = db.index_db_ref::<Tuple>();
             let oldkey = Tuple::get(&old);
             let newkey = Tuple::get(&new);
@@ -162,22 +162,23 @@ impl<T> Indices<T> for Tuple
                 db_inner.delete(tx, &oldkey).unwrap();
                 db_inner.put(tx, &newkey,  Tuple::Table::get(&new)).unwrap();
             }
-        )*);
+
+        })*);
     }
 
     #[inline(always)]
     fn on_insert<'a>(db: &Database, tx: &mut RwTxn<'a, 'a>, t: &T) {
-        for_tuples!( #(
+        for_tuples!( #({
             let db_inner = db.index_db_ref::<Tuple>();
             db_inner.put(tx, &Tuple::get(&t), Tuple::Table::get(&t)).unwrap();
-        )*);
+        })*);
     }
 
     fn on_delete<'a>(db: &Database, tx: &mut RwTxn<'a, 'a, ()>, t: &T) {
-        for_tuples!( #(
+        for_tuples!( #({
             let inner_db = db.index_db_ref::<Tuple>();
             inner_db.delete(tx, &Tuple::get(&t)).unwrap();
-        )*);
+        })*);
     }
 }
 
@@ -475,6 +476,7 @@ fn test_simple() {
     table!(Item as "Item"
         => 0: usize
     );
+    index!(Item0 as "ia", Item, => 0: usize);
 
     let db = Database::open("/tmp/db").register::<Item>();
     {
