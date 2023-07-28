@@ -3,20 +3,57 @@
 
 pub mod ord;
 
+use std::borrow::Cow;
 use crate::ord::Ordered;
 use heed::types::{DecodeIgnore, SerdeJson};
-use heed::{RoTxn, RwTxn};
+use heed::{BytesDecode, BytesEncode, RoTxn, RwTxn};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
+use std::error::Error;
+use std::marker::PhantomData;
 use std::path::Path;
+use protokit::BinProto;
+
+pub mod prelude {
+    pub use crate::{index, table, Index, Table, Format, ord::Ordered};
+    pub use heed::types::{SerdeJson};
+}
 
 type KeyType<T> = Ordered<<T as Table>::Key>;
 type ValType<T> = SerdeJson<T>;
+
+pub trait Format<'a, T>: BytesEncode<'a> + BytesDecode<'a> {}
+
+pub struct Proto<T>(PhantomData<T>);
+
+impl<'a, T: BinProto<'a> + 'a> BytesEncode<'a> for Proto<T> {
+    type EItem = T;
+
+    fn bytes_encode(item: &'a Self::EItem) -> Result<Cow<'a, [u8]>, Box<dyn Error>> {
+        protokit::binformat::encode(item).map(Cow::Owned).map_err(Into::into)
+    }
+}
+
+impl<'a, T: BinProto<'a> + Default + 'a> BytesDecode<'a> for Proto<T> {
+    type DItem = T;
+
+    fn bytes_decode(bytes: &'a [u8]) -> Result<Self::DItem, Box<dyn Error>> {
+        protokit::binformat::decode(bytes).map_err(Into::into)
+    }
+}
+
+impl<'a, T: Serialize + DeserializeOwned + 'a> Format<'a, T> for Ordered<T> {}
+
+impl<'a, T: Serialize + DeserializeOwned + 'a> Format<'a, T> for SerdeJson<T> {}
+
+impl<'a, T: Default + BinProto<'a> + 'a> Format<'a, T> for Proto<T> {}
+
 
 /// Types which should be stored.
 pub trait Table: Serialize + DeserializeOwned {
     /// Name of the table. This should be unique within database
     const NAME: &'static str;
+    type Format<'a>: Format<'a, Self> where Self: 'a;
 
     type Indices: Indices<Self>;
 
@@ -28,19 +65,35 @@ pub trait Table: Serialize + DeserializeOwned {
 
     fn get(&self) -> &Self::Key;
     fn get_mut(&mut self) -> &mut Self::Key;
+}
 
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __table_name {
+    ($a:literal $b:ty) => {$a};
+    ($b:ty) => {stringify!($b)};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __format {
+    ($a:ty) => {$a};
+    () => {SerdeJson<Self>};
 }
 
 #[macro_export]
 macro_rules! table {
-    ($name:ty $($(=> $pkey:tt)+: $keytype:ty),* $(,$idx:ty)*) => {
+    ($table:ty $(as $name:literal)? $(; $fmt:ty)? $($(=> $pkey:tt)+: $keytype:ty),* $(,$idx:ty)*) => {
         #[allow(unused_parens)]
-        impl Table for $name {
-            const NAME: &'static str = stringify!($name);
+        impl Table for $table {
+            const NAME: &'static str = $crate::__table_name!($($name)? $table);
+
+            type Format<'a> =  $crate::__format!($($fmt)?);
+            type Indices = ($($idx,)*);
+
             type Key = ($($keytype),*);
             type KeyRef<'a> = ( $(&'a $keytype),+ );
 
-            type Indices = ($($idx,)*);
             fn get(&self) -> &Self::Key {
                 ($(&self.$($pkey).* ),*)
             }
@@ -81,6 +134,7 @@ macro_rules! index {
 
 pub trait Indices<T> {
     fn on_register(db: Database) -> Database;
+    fn on_update<'a>(db: &Database, tx: &mut RwTxn<'a, 'a>, old: &T, new: &T);
     fn on_insert<'a>(db: &Database, tx: &mut RwTxn<'a, 'a>, t: &T);
     fn on_delete<'a>(db: &Database, tx: &mut RwTxn<'a, 'a>, t: &T);
 }
@@ -96,6 +150,19 @@ impl<T> Indices<T> for Tuple
     fn on_register(mut db: Database) -> Database {
         for_tuples!( #( db = db.register_idx::<Tuple>();)* );
         db
+    }
+
+    #[inline(always)]
+    fn on_update<'a>(db: &Database, tx: &mut RwTxn<'a, 'a>, old: &T, new: &T) {
+        for_tuples!( #(
+            let db_inner = db.index_db_ref::<Tuple>();
+            let oldkey = Tuple::get(&old);
+            let newkey = Tuple::get(&new);
+            if oldkey != newkey {
+                db_inner.delete(tx, &oldkey).unwrap();
+                db_inner.put(tx, &newkey,  Tuple::Table::get(&new)).unwrap();
+            }
+        )*);
     }
 
     #[inline(always)]
@@ -157,6 +224,13 @@ impl Database {
         self
     }
 
+    pub fn clear<T: Table>(&mut self) {
+        let d = self.dbs.remove(T::NAME).unwrap();
+        let mut w = self.tree.write_txn().unwrap();
+        d.clear(&mut w).unwrap();
+        w.commit().unwrap();
+    }
+
     pub fn tx(&self) -> Tx<'_> {
         Tx {
             db: self,
@@ -188,6 +262,12 @@ impl Database {
 
 impl Database {
     pub fn untyped_db<T: Table>(&self) -> heed::Database<DecodeIgnore, DecodeIgnore> {
+        self.dbs
+            .get(T::NAME)
+            .expect("Table not registered")
+            .remap_types()
+    }
+    pub fn format_db<'a, T: Table, F: Format<'a, T>>(&self) -> heed::Database<Ordered<T::Key>, F> {
         self.dbs
             .get(T::NAME)
             .expect("Table not registered")
@@ -293,11 +373,19 @@ pub trait ROps {
 pub trait RwOps<'a>: ROps {
     fn _rw_tx(&mut self) -> (&Database, &mut RwTxn<'a, 'a>);
 
+    /// Saves the item, just overwriting
     fn save<T: Table>(&mut self, v: &T) {
         let (dd, mut tx) = self._rw_tx();
         let db = dd.typed_db::<T>();
-        db.put(&mut tx, &T::get(&v), &v).unwrap();
-        T::Indices::on_insert(&dd, &mut tx, &v);
+
+        // If there is an old version of the row, check for any indexes we might want to upldate
+        if let Some(old) = db.get(tx, v.get()).unwrap() {
+            db.put(&mut tx, &T::get(&v), &v).unwrap();
+            T::Indices::on_update(&dd, &mut tx, &old, &v);
+        } else {
+            db.put(&mut tx, &T::get(&v), &v).unwrap();
+            T::Indices::on_insert(&dd, &mut tx, &v);
+        }
     }
 
     /// Find and entry based on the index, if found, overwrite it and modify object id
@@ -308,9 +396,7 @@ pub trait RwOps<'a>: ROps {
     {
         self.put_by_with::<I, _>(v, |old, v| {
             panic!("This is implemented wrongly!");
-            if old != v {
-
-            }
+            if old != v {}
             *I::Table::get_mut(v) = I::Table::get(&old).clone();
         })
     }
@@ -384,9 +470,11 @@ fn test_simple() {
     use crate::{ROps, RwOps};
     use serde::{Deserialize, Serialize};
 
-    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Default, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
     struct Item(usize, usize);
-    table!(Item => 0: usize);
+    table!(Item as "Item"
+        => 0: usize
+    );
 
     let db = Database::open("/tmp/db").register::<Item>();
     {

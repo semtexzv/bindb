@@ -10,12 +10,11 @@ documentation = "https://docs.rs/bindb"
 keywords = ["key-value", "database", "repository", "bincode"]
 license = "MIT"
 
-
 [dependencies]
 tuples = "1.4.1"
 impl-trait-for-tuples = "0.2.1"
 
 serde = { version = "1.0.175", features = ["derive"] }
 ordcode = { path = "./ordcode" }
-
+protokit = { path = "./protokit/protokit" }
 heed = { version = "0.11.0", default-features = false, features = ["serde-json", "serde-bincode", "lmdb"] }
