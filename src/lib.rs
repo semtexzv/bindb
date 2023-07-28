@@ -12,12 +12,11 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::marker::PhantomData;
 use std::path::Path;
-use protokit::BinProto;
-
 pub mod prelude {
     pub use crate::{index, table, Index, Table, Format, ord::Ordered};
     pub use heed::types::{SerdeJson};
 }
+use protokit::BinProto;
 
 type KeyType<T> = Ordered<<T as Table>::Key>;
 type ValType<T> = SerdeJson<T>;
@@ -74,27 +73,21 @@ macro_rules! __default_name {
     ($b:ty) => {stringify!($b)};
 }
 
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __format {
-    ($a:ty) => {$a};
-    () => {SerdeJson<Self>};
-}
-
 #[macro_export]
 macro_rules! table {
-    ($table:ty $(as $name:literal)? $(; $fmt:ty)? $($(=> $pkey:tt)+: $keytype:ty),* $(,$idx:ty)*) => {
+    ($table:ty $(as $name:literal)? ; $fmt:ty $($(=> $pkey:tt)+: $keytype:ty),* $(,$idx:ty)*) => {
         #[allow(unused_parens)]
         impl Table for $table {
             const NAME: &'static str = $crate::__default_name!($($name)? $table);
 
-            type Format<'a> =  $crate::__format!($($fmt)?);
+            type Format<'a> = $fmt;
             type Indices = ($($idx,)*);
 
             type Key = ($($keytype),*);
             type KeyRef<'a> = ( $(&'a $keytype),+ );
+            type KeyMut<'a> = ( $(&'a mut $keytype),+ );
 
-            fn get(&self) -> &Self::Key {
+            fn get(&self) -> Self::KeyRef {
                 ($(&self.$($pkey).* ),*)
             }
             fn get_mut(&mut self) -> &mut Self::Key {
@@ -162,7 +155,6 @@ impl<T> Indices<T> for Tuple
                 db_inner.delete(tx, &oldkey).unwrap();
                 db_inner.put(tx, &newkey,  Tuple::Table::get(&new)).unwrap();
             }
-
         })*);
     }
 
@@ -170,7 +162,14 @@ impl<T> Indices<T> for Tuple
     fn on_insert<'a>(db: &Database, tx: &mut RwTxn<'a, 'a>, t: &T) {
         for_tuples!( #({
             let db_inner = db.index_db_ref::<Tuple>();
-            db_inner.put(tx, &Tuple::get(&t), Tuple::Table::get(&t)).unwrap();
+            let key = Tuple::get(&t);
+            let prim = Tuple::Table::get(&t);
+            if let Some(old) = db_inner.get(tx, &key).unwrap() {
+                if &old != prim {
+                    panic!("Index detected an attribute change on insert");
+                }
+            }
+            db_inner.put(tx, &key, prim).unwrap();
         })*);
     }
 
@@ -374,7 +373,7 @@ pub trait ROps {
 pub trait RwOps<'a>: ROps {
     fn _rw_tx(&mut self) -> (&Database, &mut RwTxn<'a, 'a>);
 
-    /// Saves the item, just overwriting
+    /// Saves the item, just overwriting all indexes
     fn save<T: Table>(&mut self, v: &T) {
         let (dd, mut tx) = self._rw_tx();
         let db = dd.typed_db::<T>();
@@ -387,31 +386,6 @@ pub trait RwOps<'a>: ROps {
             db.put(&mut tx, &T::get(&v), &v).unwrap();
             T::Indices::on_insert(&dd, &mut tx, &v);
         }
-    }
-
-    /// Find and entry based on the index, if found, overwrite it and modify object id
-    fn save_by<I: Index>(&mut self, v: &mut I::Table)
-        where
-            <<I as Index>::Table as Table>::Key: Clone,
-            <I as Index>::Table: PartialEq
-    {
-        self.put_by_with::<I, _>(v, |old, v| {
-            panic!("This is implemented wrongly!");
-            if old != v {}
-            *I::Table::get_mut(v) = I::Table::get(&old).clone();
-        })
-    }
-
-    /// Overwrite old entry using an index as key,
-    fn put_by_with<I, F>(&mut self, v: &mut I::Table, patch: F)
-        where
-            I: Index,
-            F: FnOnce(&I::Table, &mut I::Table),
-    {
-        if let Some(old) = self.get_by::<I>(I::get(v)) {
-            patch(&old, v);
-        }
-        self.save(v)
     }
 
     fn delete<T: Table>(&mut self, k: &T::Key) {
@@ -473,7 +447,7 @@ fn test_simple() {
 
     #[derive(Default, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
     struct Item(usize, usize);
-    table!(Item as "Item"
+    table!(Item as "Item"; SerdeJson<Self>
         => 0: usize
     );
     index!(Item0 as "ia", Item, => 0: usize);
