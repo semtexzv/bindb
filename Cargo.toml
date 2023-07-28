@@ -1,0 +1,21 @@
+[package]
+name = "bindb"
+version = "0.0.3"
+authors = ["Michal Hornicky <mhornick@redhat.com>"]
+edition = "2018"
+description = "Simple typed key-value database using sled and bincode"
+repository = "https://github.com/semtexzv/rpmtools.git"
+homepage = "https://github.com/semtexzv/rpmtools.git"
+documentation = "https://docs.rs/bindb"
+keywords = ["key-value", "database", "repository", "bincode"]
+license = "MIT"
+
+
+[dependencies]
+tuples = "1.4.1"
+impl-trait-for-tuples = "0.2.1"
+
+serde = { version = "1.0.175", features = ["derive"] }
+ordcode = { path = "./ordcode" }
+
+heed = { version = "0.11.0", default-features = false, features = ["serde-json", "serde-bincode", "lmdb"] }

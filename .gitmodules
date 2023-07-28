@@ -1,0 +1,3 @@
+[submodule "ordcode"]
+	path = ordcode
+	url = https://github.com/semtexzv/ordcode
