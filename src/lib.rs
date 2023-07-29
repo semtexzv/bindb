@@ -1,97 +1,87 @@
-#![feature(associated_type_defaults)]
-#![feature(trace_macros)]
-
 pub mod ord;
 
-use std::borrow::Cow;
+#[cfg(feature = "proto")]
+pub mod proto;
+
 use crate::ord::Ordered;
 use heed::types::{DecodeIgnore, SerdeJson};
 use heed::{BytesDecode, BytesEncode, RoTxn, RwTxn};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
-use std::error::Error;
-use std::marker::PhantomData;
+use std::ops::RangeBounds;
 use std::path::Path;
+
 pub mod prelude {
-    pub use crate::{index, table, Index, Table, Format, ord::Ordered};
-    pub use heed::types::{SerdeJson};
+    pub use crate::{index, ord::Ordered, table, Format, Index, Table};
+    pub use heed::types::SerdeJson;
 }
-use protokit::BinProto;
+
+use tuples::{TupleAsRef, TupleCloned};
 
 type KeyType<T> = Ordered<<T as Table>::Key>;
-type ValType<T> = SerdeJson<T>;
 
-pub trait Format<'a, T>: BytesEncode<'a> + BytesDecode<'a> {}
-
-pub struct Proto<T>(PhantomData<T>);
-
-impl<'a, T: BinProto<'a> + 'a> BytesEncode<'a> for Proto<T> {
-    type EItem = T;
-
-    fn bytes_encode(item: &'a Self::EItem) -> Result<Cow<'a, [u8]>, Box<dyn Error>> {
-        protokit::binformat::encode(item).map(Cow::Owned).map_err(Into::into)
-    }
-}
-
-impl<'a, T: BinProto<'a> + Default + 'a> BytesDecode<'a> for Proto<T> {
-    type DItem = T;
-
-    fn bytes_decode(bytes: &'a [u8]) -> Result<Self::DItem, Box<dyn Error>> {
-        protokit::binformat::decode(bytes).map_err(Into::into)
-    }
-}
+pub trait Format<'a, T>: BytesEncode<'a, EItem=T> + BytesDecode<'a, DItem=T> {}
 
 impl<'a, T: Serialize + DeserializeOwned + 'a> Format<'a, T> for Ordered<T> {}
 
 impl<'a, T: Serialize + DeserializeOwned + 'a> Format<'a, T> for SerdeJson<T> {}
 
-impl<'a, T: Default + BinProto<'a> + 'a> Format<'a, T> for Proto<T> {}
-
-
 /// Types which should be stored.
 pub trait Table: Serialize + DeserializeOwned {
     /// Name of the table. This should be unique within database
     const NAME: &'static str;
-    type Format<'a>: Format<'a, Self> where Self: 'a;
+    type Format: for<'a> BytesEncode<'a, EItem=Self> + for<'a> BytesDecode<'a, DItem=Self>;
 
     type Indices: Indices<Self>;
 
     /// Primary key of the table. If this type is sane, then it should have same ordering
     /// in rust as it does in its bincode serialized form. Simply - Fields sorted in-order
     /// numeric values sorted naturally, and strings lexicographically.
-    type Key: PartialOrd + Serialize + DeserializeOwned;
-    type KeyRef<'a>: PartialOrd + Serialize;
+    type Key: PartialOrd
+    + Serialize
+    + DeserializeOwned
+    + for<'a> TupleAsRef<'a, OutTuple=Self::KeyRef<'a>>;
+    type KeyRef<'a>: PartialOrd + Serialize + TupleCloned<TupleOut=Self::Key>
+        where
+            Self: 'a;
+    type KeyMut<'a>: PartialOrd + Serialize
+        where
+            Self: 'a;
 
-    fn get(&self) -> &Self::Key;
-    fn get_mut(&mut self) -> &mut Self::Key;
+    fn get<'a>(&'a self) -> Self::KeyRef<'a>;
+    fn get_mut<'a>(&'a mut self) -> Self::KeyMut<'a>;
 }
 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __default_name {
-    ($a:literal $b:ty) => {$a};
-    ($b:ty) => {stringify!($b)};
+    ($a:literal $b:ty) => {
+        $a
+    };
+    ($b:ty) => {
+        stringify!($b)
+    };
 }
 
 #[macro_export]
 macro_rules! table {
-    ($table:ty $(as $name:literal)? ; $fmt:ty $($(=> $pkey:tt)+: $keytype:ty),* $(,$idx:ty)*) => {
+    ($table:ty $(as $name:literal)? :$fmt:ty $($(=> $pkey:tt)+: $keytype:ty),* $(,$idx:ty)*) => {
         #[allow(unused_parens)]
         impl Table for $table {
             const NAME: &'static str = $crate::__default_name!($($name)? $table);
 
-            type Format<'a> = $fmt;
+            type Format = $fmt;
             type Indices = ($($idx,)*);
 
-            type Key = ($($keytype),*);
-            type KeyRef<'a> = ( $(&'a $keytype),+ );
-            type KeyMut<'a> = ( $(&'a mut $keytype),+ );
+            type Key = ($($keytype,)*);
+            type KeyRef<'a> = ( $(&'a $keytype,)+ );
+            type KeyMut<'a> = ( $(&'a mut $keytype,)+ );
 
-            fn get(&self) -> Self::KeyRef {
-                ($(&self.$($pkey).* ),*)
+            fn get(&self) -> Self::KeyRef<'_> {
+                ($(&self.$($pkey).* ,)*)
             }
-            fn get_mut(&mut self) -> &mut Self::Key {
-                ($(&mut self.$($pkey).*),*)
+            fn get_mut(&mut self) -> Self::KeyMut<'_> {
+                ($(&mut self.$($pkey).*, )*)
             }
         }
     };
@@ -115,11 +105,12 @@ macro_rules! index {
         impl Index for $index {
             type Table = $src;
             const NAME: &'static str = $crate::__default_name!($($name)? $index);
-            type Key = ( $($keytype),+ );
-            type KeyRef<'a> = ( $(&'a $keytype),+ );
+
+            type Key = ( $($keytype, )+ );
+            type KeyRef<'a> = ( $(&'a $keytype,)+ );
 
             fn get<'a>(t : &'a Self::Table) -> Self::KeyRef<'a> {
-                ($( &t.$($pkey).+),+)
+                ($( &t.$($pkey).+,)+)
             }
         }
     };
@@ -127,7 +118,7 @@ macro_rules! index {
 
 pub trait Indices<T> {
     fn on_register(db: Database) -> Database;
-    fn on_update<'a>(db: &Database, tx: &mut RwTxn<'a, 'a>, old: &T, new: &T);
+    fn on_update<'a, 'items>(db: &Database, tx: &mut RwTxn<'a, 'a>, old: &'items T, new: &'items T);
     fn on_insert<'a>(db: &Database, tx: &mut RwTxn<'a, 'a>, t: &T);
     fn on_delete<'a>(db: &Database, tx: &mut RwTxn<'a, 'a>, t: &T);
 }
@@ -152,8 +143,9 @@ impl<T> Indices<T> for Tuple
             let oldkey = Tuple::get(&old);
             let newkey = Tuple::get(&new);
             if oldkey != newkey {
+                let pkey = Tuple::Table::get(&new).cloned();
                 db_inner.delete(tx, &oldkey).unwrap();
-                db_inner.put(tx, &newkey,  Tuple::Table::get(&new)).unwrap();
+                db_inner.put(tx, &newkey, &pkey).unwrap();
             }
         })*);
     }
@@ -163,13 +155,13 @@ impl<T> Indices<T> for Tuple
         for_tuples!( #({
             let db_inner = db.index_db_ref::<Tuple>();
             let key = Tuple::get(&t);
-            let prim = Tuple::Table::get(&t);
+            let prim = Tuple::Table::get(&t).cloned();
             if let Some(old) = db_inner.get(tx, &key).unwrap() {
-                if &old != prim {
+                if old.as_ref() != prim.as_ref() {
                     panic!("Index detected an attribute change on insert");
                 }
             }
-            db_inner.put(tx, &key, prim).unwrap();
+            db_inner.put(tx, &key, &prim).unwrap();
         })*);
     }
 
@@ -273,7 +265,15 @@ impl Database {
             .expect("Table not registered")
             .remap_types()
     }
-    pub fn typed_db<T: Table>(&self) -> heed::Database<Ordered<T::Key>, SerdeJson<T>> {
+    pub fn typed_db<T: Table>(&self) -> heed::Database<Ordered<T::Key>, T::Format> {
+        self.dbs
+            .get(T::NAME)
+            .expect("Table not registered")
+            .remap_types()
+    }
+    pub fn typed_db_ref<'s, 'a, 'b, T: Table>(
+        &'s self,
+    ) -> heed::Database<Ordered<T::KeyRef<'a>>, T::Format> {
         self.dbs
             .get(T::NAME)
             .expect("Table not registered")
@@ -295,10 +295,19 @@ impl Database {
             .expect("Index not registered")
             .remap_types()
     }
+
+    pub fn index_db_ref_ref<'a, I: Index>(
+        &self,
+    ) -> heed::Database<Ordered<I::KeyRef<'a>>, Ordered<<I::Table as Table>::KeyRef<'a>>> {
+        self.dbs
+            .get(I::NAME)
+            .expect("Index not registered")
+            .remap_types()
+    }
 }
 
-pub struct Iter<'a, T: Table> {
-    i: heed::RoRange<'a, KeyType<T>, ValType<T>>,
+pub struct Iter<'a, T: Table + 'a> {
+    i: heed::RoRange<'a, KeyType<T>, T::Format>,
 }
 
 impl<'a, T: Table + 'static> Iterator for Iter<'a, T> {
@@ -309,8 +318,8 @@ impl<'a, T: Table + 'static> Iterator for Iter<'a, T> {
     }
 }
 
-pub struct RevIter<'a, T: Table> {
-    i: heed::RoRevRange<'a, KeyType<T>, ValType<T>>,
+pub struct RevIter<'a, T: Table + 'a> {
+    i: heed::RoRevRange<'a, KeyType<T>, T::Format>,
 }
 
 impl<'a, T: Table + 'static> Iterator for RevIter<'a, T> {
@@ -320,7 +329,6 @@ impl<'a, T: Table + 'static> Iterator for RevIter<'a, T> {
         self.i.next().map(|v| v.unwrap().1)
     }
 }
-
 
 pub trait CommitOps {
     fn commit(self);
@@ -343,29 +351,42 @@ pub trait ROps {
     }
 
     /// Perform a primary key lookup
-    fn get<T: Table>(&self, k: &T::Key) -> Option<T> {
-        let (db, tx) = self._ro_tx();
-        let db = db.typed_db::<T>();
+    fn get1<T, K>(&self, k: &K) -> Option<T>
+        where
+            T: for<'a> Table<KeyRef<'a>=(&'a K, )>,
+            K: Serialize,
+    {
+        self.get((k, ))
+    }
 
-        let res = db.get(&tx, k).unwrap();
+    fn get2<T, K1, K2>(&self, k: &K1, k2: &K2) -> Option<T>
+        where
+            T: for<'a> Table<KeyRef<'a>=(&'a K1, &'a K2)>,
+            K1: Serialize,
+            K2: Serialize,
+    {
+        self.get((k, k2))
+    }
+
+    fn get<T: Table>(&self, k: T::KeyRef<'_>) -> Option<T> {
+        let (db, tx) = self._ro_tx();
+        let db = db.typed_db_ref::<T>();
+
+        let res = db.get(&tx, &k).unwrap();
         res
     }
 
-    /// Perform a full table scan
-    fn scan<T: Table + 'static>(&self) -> Iter<T> {
+    fn range<T: Table + 'static>(&self, range: impl RangeBounds<T::Key>) -> Iter<T> {
         let (db, tx) = self._ro_tx();
-
         let db = db.typed_db::<T>();
-        let r = db.range(&tx, &(..)).unwrap();
-
+        let r = db.range(&tx, &range).unwrap();
         Iter { i: r }
     }
-    fn rscan<T: Table + 'static>(&self) -> RevIter<T> {
+
+    fn rev_range<T: Table + 'static>(&self, range: impl RangeBounds<T::Key>) -> RevIter<T> {
         let (db, tx) = self._ro_tx();
-
         let db = db.typed_db::<T>();
-        let r = db.rev_range(&tx, &(..)).unwrap();
-
+        let r = db.rev_range(&tx, &range).unwrap();
         RevIter { i: r }
     }
 }
@@ -376,10 +397,11 @@ pub trait RwOps<'a>: ROps {
     /// Saves the item, just overwriting all indexes
     fn save<T: Table>(&mut self, v: &T) {
         let (dd, mut tx) = self._rw_tx();
-        let db = dd.typed_db::<T>();
+        let db = dd.typed_db_ref::<T>();
 
-        // If there is an old version of the row, check for any indexes we might want to upldate
-        if let Some(old) = db.get(tx, v.get()).unwrap() {
+        let key = T::get(v);
+
+        if let Some(old) = db.get(tx, &key).unwrap() {
             db.put(&mut tx, &T::get(&v), &v).unwrap();
             T::Indices::on_update(&dd, &mut tx, &old, &v);
         } else {
@@ -388,15 +410,37 @@ pub trait RwOps<'a>: ROps {
         }
     }
 
-    fn delete<T: Table>(&mut self, k: &T::Key) {
-        let (db, mut tx) = self._rw_tx();
-        let typed = db.typed_db::<T>();
+    fn clear<T: Table>(&mut self) {
+        let (dd, tx) = self._rw_tx();
+        dd.typed_db::<T>().clear(tx).unwrap();
+    }
 
-        if let Some(item) = typed.get(&tx, k).unwrap() {
+    fn delete1<T, K>(&mut self, k: &K)
+        where
+            T: for<'b> Table<KeyRef<'b>=(&'b K, )>,
+            K: Serialize,
+    {
+        self.delete::<T>((k, ));
+    }
+
+    fn delete2<T, K, K2>(&mut self, k: &K, k2: &K2)
+        where
+            T: for<'b> Table<KeyRef<'b>=(&'b K, &'b K2)>,
+            K: Serialize,
+            K2: Serialize,
+    {
+        self.delete::<T>((k, k2));
+    }
+
+    fn delete<T: Table>(&mut self, k: T::KeyRef<'_>) {
+        let (db, mut tx) = self._rw_tx();
+        let typed = db.typed_db_ref::<T>();
+
+        typed.delete(&mut tx, &k).unwrap();
+        if let Some(item) = typed.get(&tx, &k).unwrap() {
             // If the entry was stored, first update index table and only after that delete the entry
             T::Indices::on_delete(&db, &mut tx, &item);
         }
-        typed.delete(&mut tx, k).unwrap();
     }
 }
 
@@ -440,6 +484,7 @@ impl<'a> RwOps<'a> for Wtx<'a> {
     }
 }
 
+
 #[test]
 fn test_simple() {
     use crate::{ROps, RwOps};
@@ -447,12 +492,13 @@ fn test_simple() {
 
     #[derive(Default, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
     struct Item(usize, usize);
-    table!(Item as "Item"; SerdeJson<Self>
+    table!(Item as "Item": SerdeJson<Self>
         => 0: usize
     );
     index!(Item0 as "ia", Item, => 0: usize);
 
-    let db = Database::open("/tmp/db").register::<Item>();
+    let f = tempdir::TempDir::new("test").unwrap().into_path();
+    let db = Database::open(f.join("db")).register::<Item>();
     {
         let mut db = db.wtx();
         db.save(&Item(0, 0));
@@ -462,12 +508,13 @@ fn test_simple() {
         db.save(&Item(0, 0));
         db.commit();
     }
-    let mut db = db.wtx();
-    assert_eq!(db.get(&2), Some(Item(2, 0)));
 
-    let range = db.scan::<Item>();
+    let mut db = db.wtx();
+    assert_eq!(db.get1(&2), Some(Item(2, 0)));
+
+    let range = db.range::<Item>(..);
     assert_eq!(range.count(), 4);
 
-    db.delete::<Item>(&0);
-    assert_eq!(db.scan::<Item>().count(), 3);
+    db.delete::<Item>((&0, ));
+    assert_eq!(db.rev_range::<Item>(..).count(), 3);
 }
